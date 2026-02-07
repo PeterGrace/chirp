@@ -1383,7 +1383,7 @@ class Icom9700Radio(IcomCIVRadio):
             return super()._encode_tmode(mem, memobj)
 
 
-class Icom9700RadioBand(Icom9700Radio):
+class Icom9700RadioBand(Icom9700Radio, chirp_common.IcomDstarSupport):
     _SPECIAL_CHANNELS = {
         "1A": 100,
         "1B": 101,
@@ -1450,8 +1450,176 @@ class Icom9700RadioBand(Icom9700Radio):
             self._rf.valid_modes.remove('DD')
         self._classes['mem'] = IC9700MemFrame
 
+    def get_memory(self, number):
+        self._detect_baudrate()
+        LOG.debug("Getting %s" % number)
+        f = self._classes["mem"]()
 
-class Icom9700SatelliteBand(Icom9700Radio):
+        # Handle special channels and banks
+        if self._is_special(number):
+            info = self._get_special_info(number)
+            LOG.debug("Special info: %s" % info)
+            f.set_location(info.channel, info.bank)
+        elif self._rf.has_bank:
+            ch, bnk = self.mem_to_ch_bnk(number)
+            f.set_location(ch, bnk)
+            LOG.debug("Bank %i, Channel %02i" % (bnk, ch))
+        else:
+            f.set_location(number)
+
+        self._send_frame(f)
+        f = self._recv_frame(f)
+
+        if len(f.get_data()) == 0:
+            raise errors.RadioError("Radio reported error")
+        if f.get_data() and f.get_data()[-1] == 0xFF:
+            mem = chirp_common.Memory()
+            mem.number = number
+            mem.empty = True
+            LOG.debug("Found %i empty" % mem.number)
+            return mem
+
+        memobj = f.get_obj()
+        LOG.debug(repr(memobj))
+
+        # Check if this is DV mode to create appropriate memory type
+        mode = self._MODES[int(memobj.mode)]
+        if mode == 'DV':
+            mem = chirp_common.DVMemory()
+        else:
+            mem = chirp_common.Memory()
+
+        # Set basic fields
+        if self._is_special(number):
+            info = self._get_special_info(number)
+            mem.number = info.location
+            mem.extd_number = info.name
+            mem.immutable = ["number", "extd_number"]
+        else:
+            mem.number = number
+
+        mem.freq = int(memobj.freq)
+        mem.mode = mode
+        mem.name = str(memobj.name).rstrip()
+
+        # Tone mode
+        if int(memobj.tmode) in self._CROSS_MODES:
+            mem.tmode = 'Cross'
+            mem.cross_mode = self._CROSS_MODES[int(memobj.tmode)]
+        else:
+            mem.tmode = self._rf.valid_tmodes[memobj.tmode]
+
+        # DTCS polarity
+        if memobj.dtcs_polarity == 0x11:
+            mem.dtcs_polarity = "RR"
+        elif memobj.dtcs_polarity == 0x10:
+            mem.dtcs_polarity = "RN"
+        elif memobj.dtcs_polarity == 0x01:
+            mem.dtcs_polarity = "NR"
+        else:
+            mem.dtcs_polarity = "NN"
+
+        mem.dtcs = bitwise.bcd_to_int(memobj.dtcs)
+        mem.rtone = int(memobj.rtone) / 10.0
+        mem.ctone = int(memobj.ctone) / 10.0
+        mem.duplex = self._rf.valid_duplexes[memobj.duplex]
+
+        if hasattr(memobj, "duplexOffset"):
+            mem.offset = int(memobj.duplexOffset) * 100
+        else:
+            mem.immutable = ["offset"]
+
+        # DV-specific fields
+        if mode == 'DV':
+            mem.dv_urcall = str(memobj.urcall).rstrip()
+            mem.dv_rpt1call = str(memobj.rpt1call).rstrip()
+            mem.dv_rpt2call = str(memobj.rpt2call).rstrip()
+            mem.dv_code = int(memobj.dig_code)
+
+        return mem
+
+    def set_memory(self, mem):
+        self._detect_baudrate()
+        LOG.debug("Setting %s(%s)" % (mem.number, mem.extd_number))
+        f = self._get_template_memory()
+
+        if self._is_special(mem.number):
+            info = self._get_special_info(mem.number)
+            LOG.debug("Special info: %s" % info)
+            ch = info.channel
+            bnk = info.bank
+        elif self._rf.has_bank:
+            ch, bnk = self.mem_to_ch_bnk(mem.number)
+            LOG.debug("Bank %i, Channel %02i" % (bnk, ch))
+        else:
+            ch = mem.number
+
+        if mem.empty:
+            f.set_location(ch, bnk)
+            LOG.debug("Making %i empty" % mem.number)
+            f.make_empty()
+            self._send_frame(f)
+            f = self._recv_frame()
+            LOG.debug("Result:\n%s" % util.hexprint(bytes(f.get_data())))
+            return
+
+        memobj = f.get_obj()
+        memobj.bank = bnk
+        memobj.number = ch
+
+        memobj.freq = int(mem.freq)
+        memobj.mode = self._MODES.index(mem.mode)
+
+        name_length = len(memobj.name.get_value())
+        memobj.name = mem.name.ljust(name_length)[:name_length]
+
+        # Tone mode
+        cmr = {v: k for k, v in self._CROSS_MODES.items()}
+        if mem.tmode == 'Cross':
+            memobj.tmode = cmr[mem.cross_mode]
+        else:
+            memobj.tmode = self._rf.valid_tmodes.index(mem.tmode)
+
+        memobj.ctone = int(mem.ctone * 10)
+        memobj.rtone = int(mem.rtone * 10)
+
+        if mem.dtcs_polarity == "RR":
+            memobj.dtcs_polarity = 0x11
+        elif mem.dtcs_polarity == "RN":
+            memobj.dtcs_polarity = 0x10
+        elif mem.dtcs_polarity == "NR":
+            memobj.dtcs_polarity = 0x01
+        else:
+            memobj.dtcs_polarity = 0x00
+
+        bitwise.int_to_bcd(memobj.dtcs, mem.dtcs)
+
+        if self._rf.valid_duplexes:
+            memobj.duplex = self._rf.valid_duplexes.index(mem.duplex)
+            if hasattr(memobj, "duplexOffset"):
+                memobj.duplexOffset = int(mem.offset) // 100
+
+        # DV-specific fields
+        if isinstance(mem, chirp_common.DVMemory):
+            memobj.urcall = mem.dv_urcall.ljust(8)[:8]
+            memobj.rpt1call = mem.dv_rpt1call.ljust(8)[:8]
+            memobj.rpt2call = mem.dv_rpt2call.ljust(8)[:8]
+            memobj.dig_code = mem.dv_code
+        else:
+            # Clear DV fields for non-DV memories
+            memobj.urcall = ' ' * 8
+            memobj.rpt1call = ' ' * 8
+            memobj.rpt2call = ' ' * 8
+            memobj.dig_code = 0
+
+        LOG.debug(repr(memobj))
+        self._send_frame(f)
+
+        f = self._recv_frame()
+        LOG.debug("Result:\n%s" % util.hexprint(bytes(f.get_data())))
+
+
+class Icom9700SatelliteBand(Icom9700Radio, chirp_common.IcomDstarSupport):
     VARIANT = 'Satellite'
 
     def __init__(self, parent):
@@ -1493,15 +1661,15 @@ class Icom9700SatelliteBand(Icom9700Radio):
         self._detect_baudrate()
         LOG.debug("Getting %s" % number)
         f = self._classes["mem"]()
-        mem = chirp_common.Memory()
         f.set_location(number)
-        mem.number = number
         self._send_frame(f)
 
         f = self._recv_frame(f)
         if len(f.get_data()) == 0:
             raise errors.RadioError("Radio reported error")
         if f.get_data() and f.get_data()[-1] == 0xFF:
+            mem = chirp_common.Memory()
+            mem.number = number
             mem.empty = True
             mem.duplex = 'split'
             LOG.debug("Found %i empty" % mem.number)
@@ -1510,8 +1678,16 @@ class Icom9700SatelliteBand(Icom9700Radio):
         memobj = f.get_obj()
         LOG.debug(repr(memobj))
 
+        # Check if this is DV mode to create appropriate memory type
+        mode = self._MODES[int(memobj.mode)]
+        if mode == 'DV':
+            mem = chirp_common.DVMemory()
+        else:
+            mem = chirp_common.Memory()
+
+        mem.number = number
         mem.freq = int(memobj.freq)
-        mem.mode = self._MODES[int(memobj.mode)]
+        mem.mode = mode
         mem.name = str(memobj.name).rstrip()
         mem.tmode = self._rf.valid_tmodes[memobj.tmode]
 
@@ -1530,6 +1706,13 @@ class Icom9700SatelliteBand(Icom9700Radio):
         mem.duplex = 'split'
         mem.offset = int(memobj.tx.freq)
         mem.immutable = ["duplex"]
+
+        # DV-specific fields
+        if mode == 'DV':
+            mem.dv_urcall = str(memobj.urcall).rstrip()
+            mem.dv_rpt1call = str(memobj.rpt1call).rstrip()
+            mem.dv_rpt2call = str(memobj.rpt2call).rstrip()
+            mem.dv_code = int(memobj.dig_code)
 
         try:
             dig = RadioSetting("dig", "Digital",
@@ -1598,8 +1781,22 @@ class Icom9700SatelliteBand(Icom9700Radio):
         memobj.tx.dtcs_polarity = memobj.dtcs_polarity
         memobj.tx.dtcs = memobj.dtcs
 
-        memobj.urcall = memobj.rpt1call = memobj.rpt2call = ' ' * 8
-        memobj.tx.urcall = memobj.tx.rpt1call = memobj.tx.rpt2call = ' ' * 8
+        # DV-specific fields
+        if isinstance(mem, chirp_common.DVMemory):
+            memobj.urcall = mem.dv_urcall.ljust(8)[:8]
+            memobj.rpt1call = mem.dv_rpt1call.ljust(8)[:8]
+            memobj.rpt2call = mem.dv_rpt2call.ljust(8)[:8]
+            memobj.dig_code = mem.dv_code
+            # Copy DV fields to TX side for satellite
+            memobj.tx.urcall = memobj.urcall
+            memobj.tx.rpt1call = memobj.rpt1call
+            memobj.tx.rpt2call = memobj.rpt2call
+        else:
+            # Clear DV fields for non-DV memories
+            memobj.urcall = memobj.rpt1call = memobj.rpt2call = ' ' * 8
+            memobj.tx.urcall = memobj.tx.rpt1call = memobj.tx.rpt2call = ' ' * 8
+            memobj.dig_code = 0
+
         memobj.filter = memobj.tx.filter = 1
 
         for setting in mem.extra:
